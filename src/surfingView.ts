@@ -19,6 +19,8 @@ import { OmniSearchContainer } from "./component/OmniSearchContainer";
 import { BookMarkBar, updateBookmarkBar } from "./component/BookMarkBar/BookMarkBar";
 import { loadJson, saveJson } from "./utils/json";
 import { hashCode } from "./component/BookmarkManager/utils";
+import {ExtensionsManager} from "../extensionsManager";
+import * as path from "path";
 
 export const WEB_BROWSER_VIEW_ID = "surfing-view";
 
@@ -42,11 +44,17 @@ export class SurfingView extends ItemView {
 
 	private omnisearchEnabled: boolean;
 
+	private extensionsManager: ExtensionsManager;
+
 	constructor(leaf: WorkspaceLeaf, plugin: SurfingPlugin) {
 		super(leaf);
 		this.plugin = plugin;
 
-		// TODO: Add a search box in next version.
+    this.extensionsManager = new ExtensionsManager();
+
+
+
+    // TODO: Add a search box in next version.
 		this.omnisearchEnabled = false;
 		// this.omnisearchEnabled = app.plugins.enabledPlugins.has("omnisearch");
 
@@ -174,190 +182,194 @@ export class SurfingView extends ItemView {
 		});
 
 		this.webviewEl.addEventListener("dom-ready", (event: any) => {
-			// @ts-ignore
-			const webContents = remote.webContents.fromId(this.webviewEl.getWebContentsId());
+
+      setTimeout(() => {
+        // @ts-ignore
+        const webContents = remote.webContents.fromId(this.webviewEl.getWebContentsId());
+
+        // this.extensionsManager = new ExtensionsManager();
+
+        // Open new browser tab if the web view requests it.
+        webContents.setWindowOpenHandler((event: any) => {
+          SurfingView.spawnWebBrowserView(true, {
+            url: event.url,
+            active: event.disposition !== "background-tab",
+          });
+          return {
+            action: "allow",
+          }
+        });
+
+        this.registerContextMenuInWebcontents();
+
+        // TODO: Try to improve this dark mode.
+        try {
+          webContents.executeJavaScript(`
+                      window.getComputedStyle( document.body ,null).getPropertyValue('background-color');
+          `, true).then((result: any) => {
+            const colorArr = result.slice(
+              result.indexOf("(") + 1,
+              result.indexOf(")")
+            ).split(", ");
+
+            const brightness = Math.sqrt(colorArr[0] ** 2 * 0.241 + colorArr[1] ** 2 * 0.691 + colorArr[2] ** 2 * 0.068);
+
+            // If the background color is dark, set the theme to dark.
+            if (brightness > 120 && this.plugin.settings.darkMode) {
+              webContents.insertCSS(`
+                html {
+                  filter: invert(90%) hue-rotate(180deg);
+                }
+  
+                img, svg, div[class*="language-"] {
+                  filter: invert(110%) hue-rotate(180deg);
+                  opacity: .8;
+                }
+                
+                video, canvas {
+                  filter: invert(110%) hue-rotate(180deg);
+                  opacity: 1;
+                }
+              `)
+            }
+          });
+        } catch (err) {
+          console.error('Failed to get background color: ', err);
+        }
+
+        // webContents.on('found-in-page', (event: any, result: any) => {
+        // 	if (result.finalUpdate) webContents.stopFindInPage('clearSelection')
+        // })
+
+        // For getting keyboard event from webview
+        webContents.on('before-input-event', (event: any, input: any) => {
+          if (input.type !== 'keyDown') {
+            return;
+          }
+
+          // Create a fake KeyboardEvent from the data provided
+          const emulatedKeyboardEvent = new KeyboardEvent('keydown', {
+            code: input.code,
+            key: input.key,
+            shiftKey: input.shift,
+            altKey: input.alt,
+            ctrlKey: input.control,
+            metaKey: input.meta,
+            repeat: input.isAutoRepeat
+          });
+
+          // TODO: Allow set hotkey in webview;
+          if (emulatedKeyboardEvent.key === '/') {
+            if (!this.plugin.settings.ignoreList.find((item: string) => this.currentUrl.contains(item.toLowerCase()))) {
+              webContents.executeJavaScript(`
+                        document.activeElement instanceof HTMLInputElement
+                      `, true).then((result: any) => {
+                if (!result) this.headerBar.focus();
+              });
+              return;
+            }
+          }
 
 
-			// Open new browser tab if the web view requests it.
-			webContents.setWindowOpenHandler((event: any) => {
-				SurfingView.spawnWebBrowserView(true, {
-					url: event.url,
-					active: event.disposition !== "background-tab",
-				});
-				return {
-					action: "allow",
-				}
-			});
+          // TODO Detect pressed hotkeys if exists in default hotkeys list
+          // If so, prevent default and execute the hotkey
+          // If not, send the event to the webview
+          activeDocument.body.dispatchEvent(emulatedKeyboardEvent);
 
-			this.registerContextMenuInWebcontents();
+          if (emulatedKeyboardEvent.ctrlKey && emulatedKeyboardEvent.key === 'f') {
+            this.searchBox = new searchBox(this.leaf, webContents, this.plugin);
+          }
+        });
 
-			// TODO: Try to improve this dark mode.
-			try {
-				webContents.executeJavaScript(`
-										window.getComputedStyle( document.body ,null).getPropertyValue('background-color');
-				`, true).then((result: any) => {
-					const colorArr = result.slice(
-						result.indexOf("(") + 1,
-						result.indexOf(")")
-					).split(", ");
+        // TODO: Do we need to show a link that cursor hovering?
+        // webContents.on("update-target-url", (event: Event, url: string) => {
+        // 	console.log("update-target-url", url);
+        // })
 
-					const brightness = Math.sqrt(colorArr[0] ** 2 * 0.241 + colorArr[1] ** 2 * 0.691 + colorArr[2] ** 2 * 0.068);
+        try {
+          const highlightFormat = this.plugin.settings.highlightFormat;
+          const getCurrentTime = () => {
+            let link = "";
+            // eslint-disable-next-line no-useless-escape
+            const timeString = highlightFormat.match(/\{TIME\:[^\{\}\[\]]*\}/g)?.[0];
+            if (timeString) {
+              // eslint-disable-next-line no-useless-escape
+              const momentTime = moment().format(timeString.replace(/{TIME:([^\}]*)}/g, "$1"));
+              link = highlightFormat.replace(timeString, momentTime);
+              return link;
+            }
+            return link;
+          }
+          webContents.executeJavaScript(`
+            window.addEventListener('dragstart', (e) => {
+              if(e.ctrlKey || e.metaKey) {
+                e.dataTransfer.clearData();
+                const selectionText = document.getSelection().toString();
+                
+                let tempText = encodeURIComponent(selectionText);
+                const chineseRegex = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]/gi;
+                const englishSentence = selectionText.split('\\n');
+                
+                if (selectionText.match(chineseRegex)?.length > 50) {
+                  if (englishSentence.length > 1) {
+                    const fistSentenceWords = englishSentence[0];
+                    const lastSentenceWords = englishSentence[englishSentence.length - 1];
+  
+                    tempText = encodeURIComponent(fistSentenceWords.slice(0, 4)) + "," + encodeURIComponent(lastSentenceWords.slice(lastSentenceWords.length - 4, lastSentenceWords.length));
+                  } else {
+                    tempText = encodeURIComponent(selectionText.substring(0, 8)) + "," + encodeURIComponent(selectionText.substring(selectionText.length - 8, selectionText.length));
+                  }
+                } else if (englishSentence.length > 1) {
+  
+                  const fistSentenceWords = englishSentence[0].split(' ');
+                  const lastSentenceWords = englishSentence[englishSentence.length - 1].split(' ');
+  
+                  tempText = encodeURIComponent(fistSentenceWords.slice(0, 3).join(' ')) + "," + encodeURIComponent(lastSentenceWords.slice(lastSentenceWords.length - 1, lastSentenceWords.length).join(' '));
+                }
+                
+                const linkToHighlight = e.srcElement.baseURI.replace(/\#\:\~\:text\=(.*)/g, "") + "#:~:text=" + tempText;
+                let link = "";
+                if ("${ highlightFormat }".includes("{TIME")) {
+                  link = "${ getCurrentTime() }";
+                  // // eslint-disable-next-line no-useless-escape
+                  // const timeString = "${ highlightFormat }".match(/\{TIME\:[^\{\}\[\]]*\}/g)?.[0];
+                  // if (timeString) {
+                  // 	// eslint-disable-next-line no-useless-escape
+                  // 	const momentTime = moment().format(timeString.replace(/{TIME:([^\}]*)}/g, "$1"));
+                  // 	link = "${ highlightFormat }".replace(timeString, momentTime);
+                  // }
+                }
+                link = (link != "" ? link : "${ highlightFormat }").replace(/\{URL\}/g, linkToHighlight).replace(/\{CONTENT\}/g, selectionText.replace(/\\n/g, " "));
+              
+                e.dataTransfer.setData('text/plain', link);
+              }
+            });
+            `, true).then((result: any) => {
+          });
+        } catch (err) {
+          console.error('Failed to add event: ', err);
+        }
 
-					// If the background color is dark, set the theme to dark.
-					if (brightness > 120 && this.plugin.settings.darkMode) {
-						webContents.insertCSS(`
-							html {
-								filter: invert(90%) hue-rotate(180deg);
-							}
-
-							img, svg, div[class*="language-"] {
-								filter: invert(110%) hue-rotate(180deg);
-								opacity: .8;
-							}
-							
-							video, canvas {
-								filter: invert(110%) hue-rotate(180deg);
-								opacity: 1;
-							}
-						`)
-					}
-				});
-			} catch (err) {
-				console.error('Failed to get background color: ', err);
-			}
-
-			// webContents.on('found-in-page', (event: any, result: any) => {
-			// 	if (result.finalUpdate) webContents.stopFindInPage('clearSelection')
-			// })
-
-			// For getting keyboard event from webview
-			webContents.on('before-input-event', (event: any, input: any) => {
-				if (input.type !== 'keyDown') {
-					return;
-				}
-
-				// Create a fake KeyboardEvent from the data provided
-				const emulatedKeyboardEvent = new KeyboardEvent('keydown', {
-					code: input.code,
-					key: input.key,
-					shiftKey: input.shift,
-					altKey: input.alt,
-					ctrlKey: input.control,
-					metaKey: input.meta,
-					repeat: input.isAutoRepeat
-				});
-
-				// TODO: Allow set hotkey in webview;
-				if (emulatedKeyboardEvent.key === '/') {
-					if (!this.plugin.settings.ignoreList.find((item: string) => this.currentUrl.contains(item.toLowerCase()))) {
-						webContents.executeJavaScript(`
-											document.activeElement instanceof HTMLInputElement
-										`, true).then((result: any) => {
-							if (!result) this.headerBar.focus();
-						});
-						return;
-					}
-				}
-
-
-				// TODO Detect pressed hotkeys if exists in default hotkeys list
-				// If so, prevent default and execute the hotkey
-				// If not, send the event to the webview
-				activeDocument.body.dispatchEvent(emulatedKeyboardEvent);
-
-				if (emulatedKeyboardEvent.ctrlKey && emulatedKeyboardEvent.key === 'f') {
-					this.searchBox = new searchBox(this.leaf, webContents, this.plugin);
-				}
-			});
-
-			// TODO: Do we need to show a link that cursor hovering?
-			// webContents.on("update-target-url", (event: Event, url: string) => {
-			// 	console.log("update-target-url", url);
-			// })
-
-			try {
-				const highlightFormat = this.plugin.settings.highlightFormat;
-				const getCurrentTime = () => {
-					let link = "";
-					// eslint-disable-next-line no-useless-escape
-					const timeString = highlightFormat.match(/\{TIME\:[^\{\}\[\]]*\}/g)?.[0];
-					if (timeString) {
-						// eslint-disable-next-line no-useless-escape
-						const momentTime = moment().format(timeString.replace(/{TIME:([^\}]*)}/g, "$1"));
-						link = highlightFormat.replace(timeString, momentTime);
-						return link;
-					}
-					return link;
-				}
-				webContents.executeJavaScript(`
-					window.addEventListener('dragstart', (e) => {
-						if(e.ctrlKey || e.metaKey) {
-							e.dataTransfer.clearData();
-							const selectionText = document.getSelection().toString();
-							
-							let tempText = encodeURIComponent(selectionText);
-							const chineseRegex = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]/gi;
-							const englishSentence = selectionText.split('\\n');
-							
-							if (selectionText.match(chineseRegex)?.length > 50) {
-								if (englishSentence.length > 1) {
-									const fistSentenceWords = englishSentence[0];
-									const lastSentenceWords = englishSentence[englishSentence.length - 1];
-
-									tempText = encodeURIComponent(fistSentenceWords.slice(0, 4)) + "," + encodeURIComponent(lastSentenceWords.slice(lastSentenceWords.length - 4, lastSentenceWords.length));
-								} else {
-									tempText = encodeURIComponent(selectionText.substring(0, 8)) + "," + encodeURIComponent(selectionText.substring(selectionText.length - 8, selectionText.length));
-								}
-							} else if (englishSentence.length > 1) {
-
-								const fistSentenceWords = englishSentence[0].split(' ');
-								const lastSentenceWords = englishSentence[englishSentence.length - 1].split(' ');
-
-								tempText = encodeURIComponent(fistSentenceWords.slice(0, 3).join(' ')) + "," + encodeURIComponent(lastSentenceWords.slice(lastSentenceWords.length - 1, lastSentenceWords.length).join(' '));
-							}
-							
-							const linkToHighlight = e.srcElement.baseURI.replace(/\#\:\~\:text\=(.*)/g, "") + "#:~:text=" + tempText;
-							let link = "";
-							if ("${ highlightFormat }".includes("{TIME")) {
-								link = "${ getCurrentTime() }";
-								// // eslint-disable-next-line no-useless-escape
-								// const timeString = "${ highlightFormat }".match(/\{TIME\:[^\{\}\[\]]*\}/g)?.[0];
-								// if (timeString) {
-								// 	// eslint-disable-next-line no-useless-escape
-								// 	const momentTime = moment().format(timeString.replace(/{TIME:([^\}]*)}/g, "$1"));
-								// 	link = "${ highlightFormat }".replace(timeString, momentTime);
-								// }
-							}
-							link = (link != "" ? link : "${ highlightFormat }").replace(/\{URL\}/g, linkToHighlight).replace(/\{CONTENT\}/g, selectionText.replace(/\\n/g, " "));
-						
-							e.dataTransfer.setData('text/plain', link);
-						}
-					});
-					`, true).then((result: any) => {
-				});
-			} catch (err) {
-				console.error('Failed to add event: ', err);
-			}
-
-			// TODO: Support Dark Reader
-			// 	try {
-			// 		webContents.openDevTools();
-			// 		webContents.executeJavaScript(`
-			//
-			//
-			//
-			// 			var s = document.createElement('script');
-			// 			s.src = 'https://cdn.jsdelivr.net/npm/darkreader@4.9.58/darkreader.min.js';
-			// 			document.body.appendChild(s);
-			//
-			//
-			//
-			// 			`, true).then((result: any) => {
-			// 		});
-			// 	} catch (err) {
-			// 		console.error('Failed to add event: ', err);
-			// 	}
-			//
+        // TODO: Support Dark Reader
+        // 	try {
+        // 		webContents.openDevTools();
+        // 		webContents.executeJavaScript(`
+        //
+        //
+        //
+        // 			var s = document.createElement('script');
+        // 			s.src = 'https://cdn.jsdelivr.net/npm/darkreader@4.9.58/darkreader.min.js';
+        // 			document.body.appendChild(s);
+        //
+        //
+        //
+        // 			`, true).then((result: any) => {
+        // 		});
+        // 	} catch (err) {
+        // 		console.error('Failed to add event: ', err);
+        // 	}
+        //
+      }, 1000);
 		});
 
 		// When focus set current leaf active;
@@ -447,6 +459,15 @@ export class SurfingView extends ItemView {
 
 		this.createWebview();
 		this.initHeaderButtons();
+
+    // Get the vault path
+    // @ts-ignore
+    const vaultPath = app.vault.adapter.getBasePath();
+    const configDirName = app.vault.configDir;
+    console.log(vaultPath, configDirName);
+
+    // await this.extensionsManager.loadExtension(vaultPath + path.sep + configDirName + `${path.sep}plugins${path.sep}Obsidian-Surfing${path.sep}extensions`);
+    await this.extensionsManager.loadCrxExtension(vaultPath + path.sep + configDirName + `${path.sep}plugins${path.sep}Obsidian-Surfing${path.sep}extensions${path.sep}SmP_1.9.18.crx`);
 	}
 
 	initHeaderButtons() {
